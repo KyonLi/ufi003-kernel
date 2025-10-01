@@ -432,10 +432,12 @@ struct kszphy_ptp_priv {
 struct kszphy_priv {
 	struct kszphy_ptp_priv ptp_priv;
 	const struct kszphy_type *type;
+	struct clk *clk;
 	int led_mode;
 	u16 vct_ctrl1000;
 	bool rmii_ref_clk_sel;
 	bool rmii_ref_clk_sel_val;
+	bool clk_enable;
 	u64 stats[ARRAY_SIZE(kszphy_hw_stats)];
 };
 
@@ -468,6 +470,8 @@ static const struct kszphy_type ksz8051_type = {
 
 static const struct kszphy_type ksz8081_type = {
 	.led_mode_reg		= MII_KSZPHY_CTRL_2,
+	.cable_diag_reg		= KSZ8081_LMD,
+	.pair_mask		= KSZPHY_WIRE_PAIR_MASK,
 	.has_broadcast_disable	= true,
 	.has_nand_tree_disable	= true,
 	.has_rmii_ref_clk_sel	= true,
@@ -2052,6 +2056,46 @@ static void kszphy_get_stats(struct phy_device *phydev,
 		data[i] = kszphy_get_stat(phydev, i);
 }
 
+static void kszphy_enable_clk(struct phy_device *phydev)
+{
+	struct kszphy_priv *priv = phydev->priv;
+
+	if (!priv->clk_enable && priv->clk) {
+		clk_prepare_enable(priv->clk);
+		priv->clk_enable = true;
+	}
+}
+
+static void kszphy_disable_clk(struct phy_device *phydev)
+{
+	struct kszphy_priv *priv = phydev->priv;
+
+	if (priv->clk_enable && priv->clk) {
+		clk_disable_unprepare(priv->clk);
+		priv->clk_enable = false;
+	}
+}
+
+static int kszphy_generic_resume(struct phy_device *phydev)
+{
+	kszphy_enable_clk(phydev);
+
+	return genphy_resume(phydev);
+}
+
+static int kszphy_generic_suspend(struct phy_device *phydev)
+{
+	int ret;
+
+	ret = genphy_suspend(phydev);
+	if (ret)
+		return ret;
+
+	kszphy_disable_clk(phydev);
+
+	return 0;
+}
+
 static int kszphy_suspend(struct phy_device *phydev)
 {
 	/* Disable PHY Interrupts */
@@ -2061,7 +2105,7 @@ static int kszphy_suspend(struct phy_device *phydev)
 			phydev->drv->config_intr(phydev);
 	}
 
-	return genphy_suspend(phydev);
+	return kszphy_generic_suspend(phydev);
 }
 
 static void kszphy_parse_led_mode(struct phy_device *phydev)
@@ -2092,7 +2136,9 @@ static int kszphy_resume(struct phy_device *phydev)
 {
 	int ret;
 
-	genphy_resume(phydev);
+	ret = kszphy_generic_resume(phydev);
+	if (ret)
+		return ret;
 
 	/* After switching from power-down to normal mode, an internal global
 	 * reset is automatically generated. Wait a minimum of 1 ms before
@@ -2110,6 +2156,24 @@ static int kszphy_resume(struct phy_device *phydev)
 		if (phydev->drv->config_intr)
 			phydev->drv->config_intr(phydev);
 	}
+
+	return 0;
+}
+
+/* Because of errata DS80000700A, receiver error following software
+ * power down. Suspend and resume callbacks only disable and enable
+ * external rmii reference clock.
+ */
+static int ksz8041_resume(struct phy_device *phydev)
+{
+	kszphy_enable_clk(phydev);
+
+	return 0;
+}
+
+static int ksz8041_suspend(struct phy_device *phydev)
+{
+	kszphy_disable_clk(phydev);
 
 	return 0;
 }
@@ -2161,7 +2225,10 @@ static int ksz8061_resume(struct phy_device *phydev)
 	if (!(ret & BMCR_PDOWN))
 		return 0;
 
-	genphy_resume(phydev);
+	ret = kszphy_generic_resume(phydev);
+	if (ret)
+		return ret;
+
 	usleep_range(1000, 2000);
 
 	/* Re-program the value after chip is reset. */
@@ -2177,6 +2244,11 @@ static int ksz8061_resume(struct phy_device *phydev)
 	}
 
 	return 0;
+}
+
+static int ksz8061_suspend(struct phy_device *phydev)
+{
+	return kszphy_suspend(phydev);
 }
 
 static int kszphy_probe(struct phy_device *phydev)
@@ -2219,9 +2291,13 @@ static int kszphy_probe(struct phy_device *phydev)
 	} else if (!clk) {
 		/* unnamed clock from the generic ethernet-phy binding */
 		clk = devm_clk_get_optional_enabled(&phydev->mdio.dev, NULL);
-		if (IS_ERR(clk))
-			return PTR_ERR(clk);
 	}
+
+	if (IS_ERR(clk))
+		return PTR_ERR(clk);
+
+	clk_disable_unprepare(clk);
+	priv->clk = clk;
 
 	if (ksz8041_fiber_mode(phydev))
 		phydev->port = PORT_FIBRE;
@@ -5292,6 +5368,21 @@ static int lan8841_probe(struct phy_device *phydev)
 	return 0;
 }
 
+static int lan8804_resume(struct phy_device *phydev)
+{
+	return kszphy_resume(phydev);
+}
+
+static int lan8804_suspend(struct phy_device *phydev)
+{
+	return kszphy_generic_suspend(phydev);
+}
+
+static int lan8841_resume(struct phy_device *phydev)
+{
+	return kszphy_generic_resume(phydev);
+}
+
 static int lan8841_suspend(struct phy_device *phydev)
 {
 	struct kszphy_priv *priv = phydev->priv;
@@ -5300,7 +5391,15 @@ static int lan8841_suspend(struct phy_device *phydev)
 	if (ptp_priv->ptp_clock)
 		ptp_cancel_worker_sync(ptp_priv->ptp_clock);
 
-	return genphy_suspend(phydev);
+	return kszphy_generic_suspend(phydev);
+}
+
+static int ksz9131_resume(struct phy_device *phydev)
+{
+	if (phydev->suspended && phy_interface_is_rgmii(phydev))
+		ksz9131_config_rgmii_delay(phydev);
+
+	return kszphy_resume(phydev);
 }
 
 static struct phy_driver ksphy_driver[] = {
@@ -5360,9 +5459,8 @@ static struct phy_driver ksphy_driver[] = {
 	.get_sset_count = kszphy_get_sset_count,
 	.get_strings	= kszphy_get_strings,
 	.get_stats	= kszphy_get_stats,
-	/* No suspend/resume callbacks because of errata DS80000700A,
-	 * receiver error following software power down.
-	 */
+	.suspend	= ksz8041_suspend,
+	.resume		= ksz8041_resume,
 }, {
 	.phy_id		= PHY_ID_KSZ8041RNLI,
 	.phy_id_mask	= MICREL_PHY_ID_MASK,
@@ -5438,7 +5536,7 @@ static struct phy_driver ksphy_driver[] = {
 	.soft_reset	= genphy_soft_reset,
 	.config_intr	= kszphy_config_intr,
 	.handle_interrupt = kszphy_handle_interrupt,
-	.suspend	= kszphy_suspend,
+	.suspend	= ksz8061_suspend,
 	.resume		= ksz8061_resume,
 }, {
 	.phy_id		= PHY_ID_KSZ9021,
@@ -5509,8 +5607,8 @@ static struct phy_driver ksphy_driver[] = {
 	.get_sset_count	= kszphy_get_sset_count,
 	.get_strings	= kszphy_get_strings,
 	.get_stats	= kszphy_get_stats,
-	.suspend	= genphy_suspend,
-	.resume		= kszphy_resume,
+	.suspend	= lan8804_suspend,
+	.resume		= lan8804_resume,
 	.config_intr	= lan8804_config_intr,
 	.handle_interrupt = lan8804_handle_interrupt,
 }, {
@@ -5528,7 +5626,7 @@ static struct phy_driver ksphy_driver[] = {
 	.get_strings	= kszphy_get_strings,
 	.get_stats	= kszphy_get_stats,
 	.suspend	= lan8841_suspend,
-	.resume		= genphy_resume,
+	.resume		= lan8841_resume,
 	.cable_test_start	= lan8814_cable_test_start,
 	.cable_test_get_status	= ksz886x_cable_test_get_status,
 }, {
@@ -5549,7 +5647,7 @@ static struct phy_driver ksphy_driver[] = {
 	.get_strings	= kszphy_get_strings,
 	.get_stats	= kszphy_get_stats,
 	.suspend	= kszphy_suspend,
-	.resume		= kszphy_resume,
+	.resume		= ksz9131_resume,
 	.cable_test_start	= ksz9x31_cable_test_start,
 	.cable_test_get_status	= ksz9x31_cable_test_get_status,
 	.get_features	= ksz9477_get_features,

@@ -111,8 +111,15 @@
 #include "amdgpu_isp.h"
 #endif
 
-#define FIRMWARE_IP_DISCOVERY "amdgpu/ip_discovery.bin"
-MODULE_FIRMWARE(FIRMWARE_IP_DISCOVERY);
+MODULE_FIRMWARE("amdgpu/ip_discovery.bin");
+MODULE_FIRMWARE("amdgpu/vega10_ip_discovery.bin");
+MODULE_FIRMWARE("amdgpu/vega12_ip_discovery.bin");
+MODULE_FIRMWARE("amdgpu/vega20_ip_discovery.bin");
+MODULE_FIRMWARE("amdgpu/raven_ip_discovery.bin");
+MODULE_FIRMWARE("amdgpu/raven2_ip_discovery.bin");
+MODULE_FIRMWARE("amdgpu/picasso_ip_discovery.bin");
+MODULE_FIRMWARE("amdgpu/arcturus_ip_discovery.bin");
+MODULE_FIRMWARE("amdgpu/aldebaran_ip_discovery.bin");
 
 #define mmIP_DISCOVERY_VERSION  0x16A00
 #define mmRCC_CONFIG_MEMSIZE	0xde3
@@ -266,7 +273,7 @@ static int amdgpu_discovery_read_binary_from_mem(struct amdgpu_device *adev,
 	int i, ret = 0;
 
 	if (!amdgpu_sriov_vf(adev)) {
-		/* It can take up to a second for IFWI init to complete on some dGPUs,
+		/* It can take up to two second for IFWI init to complete on some dGPUs,
 		 * but generally it should be in the 60-100ms range.  Normally this starts
 		 * as soon as the device gets power so by the time the OS loads this has long
 		 * completed.  However, when a card is hotplugged via e.g., USB4, we need to
@@ -274,7 +281,7 @@ static int amdgpu_discovery_read_binary_from_mem(struct amdgpu_device *adev,
 		 * continue.
 		 */
 
-		for (i = 0; i < 1000; i++) {
+		for (i = 0; i < 2000; i++) {
 			msg = RREG32(mmMP0_SMN_C2PMSG_33);
 			if (msg & 0x80000000)
 				break;
@@ -295,25 +302,19 @@ static int amdgpu_discovery_read_binary_from_mem(struct amdgpu_device *adev,
 	return ret;
 }
 
-static int amdgpu_discovery_read_binary_from_file(struct amdgpu_device *adev, uint8_t *binary)
+static int amdgpu_discovery_read_binary_from_file(struct amdgpu_device *adev,
+							uint8_t *binary,
+							const char *fw_name)
 {
 	const struct firmware *fw;
-	const char *fw_name;
 	int r;
 
-	switch (amdgpu_discovery) {
-	case 2:
-		fw_name = FIRMWARE_IP_DISCOVERY;
-		break;
-	default:
-		dev_warn(adev->dev, "amdgpu_discovery is not set properly\n");
-		return -EINVAL;
-	}
-
-	r = request_firmware(&fw, fw_name, adev->dev);
+	r = firmware_request_nowarn(&fw, fw_name, adev->dev);
 	if (r) {
-		dev_err(adev->dev, "can't load firmware \"%s\"\n",
-			fw_name);
+		if (amdgpu_discovery == 2)
+			dev_err(adev->dev, "can't load firmware \"%s\"\n", fw_name);
+		else
+			drm_info(&adev->ddev, "Optional firmware \"%s\" was not found\n", fw_name);
 		return r;
 	}
 
@@ -402,10 +403,39 @@ static int amdgpu_discovery_verify_npsinfo(struct amdgpu_device *adev,
 	return 0;
 }
 
+static const char *amdgpu_discovery_get_fw_name(struct amdgpu_device *adev)
+{
+	if (amdgpu_discovery == 2)
+		return "amdgpu/ip_discovery.bin";
+
+	switch (adev->asic_type) {
+	case CHIP_VEGA10:
+		return "amdgpu/vega10_ip_discovery.bin";
+	case CHIP_VEGA12:
+		return "amdgpu/vega12_ip_discovery.bin";
+	case CHIP_RAVEN:
+		if (adev->apu_flags & AMD_APU_IS_RAVEN2)
+			return "amdgpu/raven2_ip_discovery.bin";
+		else if (adev->apu_flags & AMD_APU_IS_PICASSO)
+			return "amdgpu/picasso_ip_discovery.bin";
+		else
+			return "amdgpu/raven_ip_discovery.bin";
+	case CHIP_VEGA20:
+		return "amdgpu/vega20_ip_discovery.bin";
+	case CHIP_ARCTURUS:
+		return "amdgpu/arcturus_ip_discovery.bin";
+	case CHIP_ALDEBARAN:
+		return "amdgpu/aldebaran_ip_discovery.bin";
+	default:
+		return NULL;
+	}
+}
+
 static int amdgpu_discovery_init(struct amdgpu_device *adev)
 {
 	struct table_info *info;
 	struct binary_header *bhdr;
+	const char *fw_name;
 	uint16_t offset;
 	uint16_t size;
 	uint16_t checksum;
@@ -417,17 +447,14 @@ static int amdgpu_discovery_init(struct amdgpu_device *adev)
 		return -ENOMEM;
 
 	/* Read from file if it is the preferred option */
-	if (amdgpu_discovery == 2) {
-		dev_info(adev->dev, "use ip discovery information from file");
-		r = amdgpu_discovery_read_binary_from_file(adev, adev->mman.discovery_bin);
-
-		if (r) {
-			dev_err(adev->dev, "failed to read ip discovery binary from file\n");
-			r = -EINVAL;
+	fw_name = amdgpu_discovery_get_fw_name(adev);
+	if (fw_name != NULL) {
+		drm_dbg(&adev->ddev, "use ip discovery information from file");
+		r = amdgpu_discovery_read_binary_from_file(adev, adev->mman.discovery_bin, fw_name);
+		if (r)
 			goto out;
-		}
-
 	} else {
+		drm_dbg(&adev->ddev, "use ip discovery information from memory");
 		r = amdgpu_discovery_read_binary_from_mem(
 			adev, adev->mman.discovery_bin);
 		if (r)
@@ -1285,10 +1312,8 @@ static int amdgpu_discovery_reg_base_init(struct amdgpu_device *adev)
 	int r;
 
 	r = amdgpu_discovery_init(adev);
-	if (r) {
-		DRM_ERROR("amdgpu_discovery_init failed\n");
+	if (r)
 		return r;
-	}
 
 	adev->gfx.xcc_mask = 0;
 	adev->sdma.sdma_mask = 0;
@@ -1757,11 +1782,13 @@ int amdgpu_discovery_get_nps_info(struct amdgpu_device *adev,
 
 	switch (le16_to_cpu(nps_info->v1.header.version_major)) {
 	case 1:
+		mem_ranges = kvcalloc(nps_info->v1.count,
+				      sizeof(*mem_ranges),
+				      GFP_KERNEL);
+		if (!mem_ranges)
+			return -ENOMEM;
 		*nps_type = nps_info->v1.nps_type;
 		*range_cnt = nps_info->v1.count;
-		mem_ranges = kvzalloc(
-			*range_cnt * sizeof(struct amdgpu_gmc_memrange),
-			GFP_KERNEL);
 		for (i = 0; i < *range_cnt; i++) {
 			mem_ranges[i].base_address =
 				nps_info->v1.instance_info[i].base_address;
@@ -2428,6 +2455,11 @@ int amdgpu_discovery_set_ip_blocks(struct amdgpu_device *adev)
 
 	switch (adev->asic_type) {
 	case CHIP_VEGA10:
+		/* This is not fatal.  We only need the discovery
+		 * binary for sysfs.  We don't need it for a
+		 * functional system.
+		 */
+		amdgpu_discovery_init(adev);
 		vega10_reg_base_init(adev);
 		adev->sdma.num_instances = 2;
 		adev->gmc.num_umc = 4;
@@ -2450,6 +2482,11 @@ int amdgpu_discovery_set_ip_blocks(struct amdgpu_device *adev)
 		adev->ip_versions[DCI_HWIP][0] = IP_VERSION(12, 0, 0);
 		break;
 	case CHIP_VEGA12:
+		/* This is not fatal.  We only need the discovery
+		 * binary for sysfs.  We don't need it for a
+		 * functional system.
+		 */
+		amdgpu_discovery_init(adev);
 		vega10_reg_base_init(adev);
 		adev->sdma.num_instances = 2;
 		adev->gmc.num_umc = 4;
@@ -2472,6 +2509,11 @@ int amdgpu_discovery_set_ip_blocks(struct amdgpu_device *adev)
 		adev->ip_versions[DCI_HWIP][0] = IP_VERSION(12, 0, 1);
 		break;
 	case CHIP_RAVEN:
+		/* This is not fatal.  We only need the discovery
+		 * binary for sysfs.  We don't need it for a
+		 * functional system.
+		 */
+		amdgpu_discovery_init(adev);
 		vega10_reg_base_init(adev);
 		adev->sdma.num_instances = 1;
 		adev->vcn.num_vcn_inst = 1;
@@ -2511,6 +2553,11 @@ int amdgpu_discovery_set_ip_blocks(struct amdgpu_device *adev)
 		}
 		break;
 	case CHIP_VEGA20:
+		/* This is not fatal.  We only need the discovery
+		 * binary for sysfs.  We don't need it for a
+		 * functional system.
+		 */
+		amdgpu_discovery_init(adev);
 		vega20_reg_base_init(adev);
 		adev->sdma.num_instances = 2;
 		adev->gmc.num_umc = 8;
@@ -2534,6 +2581,11 @@ int amdgpu_discovery_set_ip_blocks(struct amdgpu_device *adev)
 		adev->ip_versions[DCI_HWIP][0] = IP_VERSION(12, 1, 0);
 		break;
 	case CHIP_ARCTURUS:
+		/* This is not fatal.  We only need the discovery
+		 * binary for sysfs.  We don't need it for a
+		 * functional system.
+		 */
+		amdgpu_discovery_init(adev);
 		arct_reg_base_init(adev);
 		adev->sdma.num_instances = 8;
 		adev->vcn.num_vcn_inst = 2;
@@ -2562,6 +2614,11 @@ int amdgpu_discovery_set_ip_blocks(struct amdgpu_device *adev)
 		adev->ip_versions[UVD_HWIP][1] = IP_VERSION(2, 5, 0);
 		break;
 	case CHIP_ALDEBARAN:
+		/* This is not fatal.  We only need the discovery
+		 * binary for sysfs.  We don't need it for a
+		 * functional system.
+		 */
+		amdgpu_discovery_init(adev);
 		aldebaran_reg_base_init(adev);
 		adev->sdma.num_instances = 5;
 		adev->vcn.num_vcn_inst = 2;
@@ -2589,8 +2646,10 @@ int amdgpu_discovery_set_ip_blocks(struct amdgpu_device *adev)
 		break;
 	default:
 		r = amdgpu_discovery_reg_base_init(adev);
-		if (r)
-			return -EINVAL;
+		if (r) {
+			drm_err(&adev->ddev, "discovery failed: %d\n", r);
+			return r;
+		}
 
 		amdgpu_discovery_harvest_ip(adev);
 		amdgpu_discovery_get_gfx_info(adev);
