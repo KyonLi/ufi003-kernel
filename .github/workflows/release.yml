@@ -1,10 +1,8 @@
-name: Build kernel deb packages
+name: Release kernel deb packages
 on:
   push:
-    branches:
-      - '*'
-  pull_request:
-  workflow_dispatch:
+    tags:
+      - "*"
 
 jobs:
   build:
@@ -32,7 +30,7 @@ jobs:
           make deb-pkg -j"$(($(grep -c processor < /proc/cpuinfo)*2))"
 
       - name: Prepare artifacts
-        run: mkdir artifacts && mv ../linux-image-*.deb ../linux-headers-*.deb artifacts/
+        run: mkdir artifacts && mv ../linux-* artifacts/
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -65,8 +63,11 @@ jobs:
           cd .github/scripts
           sudo ./build_boot_img.sh
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+      - name: Generate release info
+        run: git log -1 --format=%B > changes.txt
+
+      - name: Releases
+        uses: softprops/action-gh-release@v2
         with:
-          name: kernel and boot images
-          path: artifacts/*
+          body_path: changes.txt
+          files: artifacts/*
