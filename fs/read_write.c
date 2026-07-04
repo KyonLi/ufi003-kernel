@@ -1600,6 +1600,13 @@ ssize_t vfs_copy_file_range(struct file *file_in, loff_t pos_in,
 	if (len == 0)
 		return 0;
 
+	/*
+	 * Make sure return value doesn't overflow in 32bit compat mode.  Also
+	 * limit the size for all cases except when calling ->copy_file_range().
+	 */
+	if (splice || !file_out->f_op->copy_file_range || in_compat_syscall())
+		len = min_t(size_t, MAX_RW_COUNT, len);
+
 	file_start_write(file_out);
 
 	/*
@@ -1613,9 +1620,7 @@ ssize_t vfs_copy_file_range(struct file *file_in, loff_t pos_in,
 						      len, flags);
 	} else if (!splice && file_in->f_op->remap_file_range && samesb) {
 		ret = file_in->f_op->remap_file_range(file_in, pos_in,
-				file_out, pos_out,
-				min_t(loff_t, MAX_RW_COUNT, len),
-				REMAP_FILE_CAN_SHORTEN);
+				file_out, pos_out, len, REMAP_FILE_CAN_SHORTEN);
 		/* fallback to splice */
 		if (ret <= 0)
 			splice = true;
@@ -1648,8 +1653,7 @@ ssize_t vfs_copy_file_range(struct file *file_in, loff_t pos_in,
 	 * to splicing from input file, while file_start_write() is held on
 	 * the output file on a different sb.
 	 */
-	ret = do_splice_direct(file_in, &pos_in, file_out, &pos_out,
-			       min_t(size_t, len, MAX_RW_COUNT), 0);
+	ret = do_splice_direct(file_in, &pos_in, file_out, &pos_out, len, 0);
 done:
 	if (ret > 0) {
 		fsnotify_access(file_in);
@@ -1671,36 +1675,32 @@ SYSCALL_DEFINE6(copy_file_range, int, fd_in, loff_t __user *, off_in,
 {
 	loff_t pos_in;
 	loff_t pos_out;
-	struct fd f_in;
-	struct fd f_out;
 	ssize_t ret = -EBADF;
 
-	f_in = fdget(fd_in);
-	if (!fd_file(f_in))
-		goto out2;
+	CLASS(fd, f_in)(fd_in);
+	if (fd_empty(f_in))
+		return -EBADF;
 
-	f_out = fdget(fd_out);
-	if (!fd_file(f_out))
-		goto out1;
+	CLASS(fd, f_out)(fd_out);
+	if (fd_empty(f_out))
+		return -EBADF;
 
-	ret = -EFAULT;
 	if (off_in) {
 		if (copy_from_user(&pos_in, off_in, sizeof(loff_t)))
-			goto out;
+			return -EFAULT;
 	} else {
 		pos_in = fd_file(f_in)->f_pos;
 	}
 
 	if (off_out) {
 		if (copy_from_user(&pos_out, off_out, sizeof(loff_t)))
-			goto out;
+			return -EFAULT;
 	} else {
 		pos_out = fd_file(f_out)->f_pos;
 	}
 
-	ret = -EINVAL;
 	if (flags != 0)
-		goto out;
+		return -EINVAL;
 
 	ret = vfs_copy_file_range(fd_file(f_in), pos_in, fd_file(f_out), pos_out, len,
 				  flags);
@@ -1722,12 +1722,6 @@ SYSCALL_DEFINE6(copy_file_range, int, fd_in, loff_t __user *, off_in,
 			fd_file(f_out)->f_pos = pos_out;
 		}
 	}
-
-out:
-	fdput(f_out);
-out1:
-	fdput(f_in);
-out2:
 	return ret;
 }
 

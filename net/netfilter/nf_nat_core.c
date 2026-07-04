@@ -298,25 +298,13 @@ nf_nat_used_tuple_new(const struct nf_conntrack_tuple *tuple,
 
 	ct = nf_ct_tuplehash_to_ctrack(thash);
 
-	/* NB: IP_CT_DIR_ORIGINAL should be impossible because
-	 * nf_nat_used_tuple() handles origin collisions.
-	 *
-	 * Handle remote chance other CPU confirmed its ct right after.
-	 */
-	if (thash->tuple.dst.dir != IP_CT_DIR_REPLY)
-		goto out;
-
 	/* clashing connection subject to NAT? Retry with new tuple. */
 	if (READ_ONCE(ct->status) & uses_nat)
 		goto out;
 
 	if (nf_ct_tuple_equal(&ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple,
-			      &ignored_ct->tuplehash[IP_CT_DIR_REPLY].tuple) &&
-	    nf_ct_tuple_equal(&ct->tuplehash[IP_CT_DIR_REPLY].tuple,
-			      &ignored_ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple)) {
+			      &ignored_ct->tuplehash[IP_CT_DIR_REPLY].tuple))
 		taken = false;
-		goto out;
-	}
 out:
 	nf_ct_put(ct);
 	return taken;
@@ -1365,6 +1353,7 @@ static int __init nf_nat_init(void)
 		RCU_INIT_POINTER(nf_nat_hook, NULL);
 		nf_ct_helper_expectfn_unregister(&follow_master_nat);
 		synchronize_net();
+		nf_ct_helper_expectfn_destroy(&follow_master_nat);
 		unregister_pernet_subsys(&nat_net_ops);
 		kvfree(nf_nat_bysource);
 	}
@@ -1382,6 +1371,7 @@ static void __exit nf_nat_cleanup(void)
 	RCU_INIT_POINTER(nf_nat_hook, NULL);
 
 	synchronize_net();
+	nf_ct_helper_expectfn_destroy(&follow_master_nat);
 	kvfree(nf_nat_bysource);
 	unregister_pernet_subsys(&nat_net_ops);
 }

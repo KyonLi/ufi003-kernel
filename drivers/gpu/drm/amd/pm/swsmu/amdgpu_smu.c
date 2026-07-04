@@ -746,9 +746,9 @@ static int smu_set_funcs(struct amdgpu_device *adev)
 	return 0;
 }
 
-static int smu_early_init(void *handle)
+static int smu_early_init(struct amdgpu_ip_block *ip_block)
 {
-	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+	struct amdgpu_device *adev = ip_block->adev;
 	struct smu_context *smu;
 	int r;
 
@@ -1940,6 +1940,12 @@ static int smu_disable_dpms(struct smu_context *smu)
 	 */
 	if (IP_VERSION_MAJ(amdgpu_ip_version(adev, GC_HWIP, 0)) >= 11 &&
 	    smu->is_apu && (amdgpu_in_reset(adev) || adev->in_s0ix))
+		return 0;
+
+	/* vangogh s0ix */
+	if ((amdgpu_ip_version(adev, MP1_HWIP, 0) == IP_VERSION(11, 5, 0) ||
+	     amdgpu_ip_version(adev, MP1_HWIP, 0) == IP_VERSION(11, 5, 2)) &&
+	    adev->in_s0ix)
 		return 0;
 
 	/*

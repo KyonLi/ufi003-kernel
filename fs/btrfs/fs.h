@@ -114,6 +114,7 @@ enum {
 	BTRFS_FS_LOG_RECOVERING,
 	BTRFS_FS_OPEN,
 	BTRFS_FS_QUOTA_ENABLED,
+	BTRFS_FS_SQUOTA_ENABLING,
 	BTRFS_FS_UPDATE_UUID_TREE_GEN,
 	BTRFS_FS_CREATING_FREE_SPACE_TREE,
 	BTRFS_FS_BTREE_ERR,
@@ -229,6 +230,14 @@ enum {
 	BTRFS_MOUNT_IGNOREMETACSUMS		= (1ULL << 31),
 	BTRFS_MOUNT_IGNORESUPERFLAGS		= (1ULL << 32),
 };
+
+/* These mount options require a full read-only fs, no new transaction is allowed. */
+#define BTRFS_MOUNT_FULL_RO_MASK		\
+	(BTRFS_MOUNT_NOLOGREPLAY |		\
+	 BTRFS_MOUNT_IGNOREBADROOTS |		\
+	 BTRFS_MOUNT_IGNOREDATACSUMS |		\
+	 BTRFS_MOUNT_IGNOREMETACSUMS |		\
+	 BTRFS_MOUNT_IGNORESUPERFLAGS)
 
 /*
  * Compat flags that we support.  If any incompat flags are set other than the
@@ -708,7 +717,6 @@ struct btrfs_fs_info {
 	 * running.
 	 */
 	refcount_t scrub_workers_refcnt;
-	u32 sectors_per_page;
 	struct workqueue_struct *scrub_workers;
 
 	struct btrfs_discard_ctl discard_ctl;
@@ -974,6 +982,12 @@ static inline u32 count_max_extents(const struct btrfs_fs_info *fs_info, u64 siz
 #endif
 
 	return div_u64(size + fs_info->max_extent_size - 1, fs_info->max_extent_size);
+}
+
+static inline unsigned int btrfs_blocks_per_folio(const struct btrfs_fs_info *fs_info,
+						  const struct folio *folio)
+{
+	return folio_size(folio) >> fs_info->sectorsize_bits;
 }
 
 bool btrfs_exclop_start(struct btrfs_fs_info *fs_info,

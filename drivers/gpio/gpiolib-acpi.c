@@ -268,7 +268,7 @@ static void acpi_gpiochip_request_irq(struct acpi_gpio_chip *acpi_gpio,
 	event->irq_requested = true;
 
 	/* Make sure we trigger the initial state of edge-triggered IRQs */
-	if (run_edge_events_on_boot &&
+	if (acpi_gpio_need_run_edge_events_on_boot() &&
 	    (event->irqflags & (IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING))) {
 		value = gpiod_get_raw_value_cansleep(event->desc);
 		if (((event->irqflags & IRQF_TRIGGER_RISING) && value == 1) ||
@@ -350,13 +350,50 @@ static struct gpio_desc *acpi_request_own_gpiod(struct gpio_chip *chip,
 	return desc;
 }
 
-static bool acpi_gpio_in_ignore_list(const char *ignore_list, const char *controller_in,
-				     unsigned int pin_in)
+bool acpi_gpio_add_to_deferred_list(struct list_head *list)
 {
-	const char *controller, *pin_str;
+	bool defer;
+
+	mutex_lock(&acpi_gpio_deferred_req_irqs_lock);
+	defer = !acpi_gpio_deferred_req_irqs_done;
+	if (defer)
+		list_add(list, &acpi_gpio_deferred_req_irqs_list);
+	mutex_unlock(&acpi_gpio_deferred_req_irqs_lock);
+
+	return defer;
+}
+
+void acpi_gpio_remove_from_deferred_list(struct list_head *list)
+{
+	mutex_lock(&acpi_gpio_deferred_req_irqs_lock);
+	if (!list_empty(list))
+		list_del_init(list);
+	mutex_unlock(&acpi_gpio_deferred_req_irqs_lock);
+}
+
+int acpi_gpio_need_run_edge_events_on_boot(void)
+{
+	return run_edge_events_on_boot;
+}
+
+bool acpi_gpio_in_ignore_list(enum acpi_gpio_ignore_list list, const char *controller_in,
+			      unsigned int pin_in)
+{
+	const char *ignore_list, *controller, *pin_str;
 	unsigned int pin;
 	char *endp;
 	int len;
+
+	switch (list) {
+	case ACPI_GPIO_IGNORE_WAKE:
+		ignore_list = ignore_wake;
+		break;
+	case ACPI_GPIO_IGNORE_INTERRUPT:
+		ignore_list = ignore_interrupt;
+		break;
+	default:
+		return false;
+	}
 
 	controller = ignore_list;
 	while (controller) {
@@ -394,7 +431,7 @@ static bool acpi_gpio_irq_is_wake(struct device *parent,
 	if (agpio->wake_capable != ACPI_WAKE_CAPABLE)
 		return false;
 
-	if (acpi_gpio_in_ignore_list(ignore_wake, dev_name(parent), pin)) {
+	if (acpi_gpio_in_ignore_list(ACPI_GPIO_IGNORE_WAKE, dev_name(parent), pin)) {
 		dev_info(parent, "Ignoring wakeup on pin %u\n", pin);
 		return false;
 	}
@@ -437,7 +474,7 @@ static acpi_status acpi_gpiochip_alloc_event(struct acpi_resource *ares,
 	if (!handler)
 		return AE_OK;
 
-	if (acpi_gpio_in_ignore_list(ignore_interrupt, dev_name(chip->parent), pin)) {
+	if (acpi_gpio_in_ignore_list(ACPI_GPIO_IGNORE_INTERRUPT, dev_name(chip->parent), pin)) {
 		dev_info(chip->parent, "Ignoring interrupt on pin %u\n", pin);
 		return AE_OK;
 	}
@@ -525,7 +562,6 @@ void acpi_gpiochip_request_interrupts(struct gpio_chip *chip)
 	struct acpi_gpio_chip *acpi_gpio;
 	acpi_handle handle;
 	acpi_status status;
-	bool defer;
 
 	if (!chip->parent || !chip->to_irq)
 		return;
@@ -544,14 +580,7 @@ void acpi_gpiochip_request_interrupts(struct gpio_chip *chip)
 	acpi_walk_resources(handle, METHOD_NAME__AEI,
 			    acpi_gpiochip_alloc_event, acpi_gpio);
 
-	mutex_lock(&acpi_gpio_deferred_req_irqs_lock);
-	defer = !acpi_gpio_deferred_req_irqs_done;
-	if (defer)
-		list_add(&acpi_gpio->deferred_req_irqs_list_entry,
-			 &acpi_gpio_deferred_req_irqs_list);
-	mutex_unlock(&acpi_gpio_deferred_req_irqs_lock);
-
-	if (defer)
+	if (acpi_gpio_add_to_deferred_list(&acpi_gpio->deferred_req_irqs_list_entry))
 		return;
 
 	acpi_gpiochip_request_irqs(acpi_gpio);
@@ -583,10 +612,7 @@ void acpi_gpiochip_free_interrupts(struct gpio_chip *chip)
 	if (ACPI_FAILURE(status))
 		return;
 
-	mutex_lock(&acpi_gpio_deferred_req_irqs_lock);
-	if (!list_empty(&acpi_gpio->deferred_req_irqs_list_entry))
-		list_del_init(&acpi_gpio->deferred_req_irqs_list_entry);
-	mutex_unlock(&acpi_gpio_deferred_req_irqs_lock);
+	acpi_gpio_remove_from_deferred_list(&acpi_gpio->deferred_req_irqs_list_entry);
 
 	list_for_each_entry_safe_reverse(event, ep, &acpi_gpio->events, node) {
 		if (event->irq_requested) {
@@ -603,6 +629,14 @@ void acpi_gpiochip_free_interrupts(struct gpio_chip *chip)
 	}
 }
 EXPORT_SYMBOL_GPL(acpi_gpiochip_free_interrupts);
+
+void __init acpi_gpio_process_deferred_list(struct list_head *list)
+{
+	struct acpi_gpio_chip *acpi_gpio, *tmp;
+
+	list_for_each_entry_safe(acpi_gpio, tmp, list, deferred_req_irqs_list_entry)
+		acpi_gpiochip_request_irqs(acpi_gpio);
+}
 
 int acpi_dev_add_driver_gpios(struct acpi_device *adev,
 			      const struct acpi_gpio_mapping *gpios)
@@ -1494,14 +1528,8 @@ int acpi_gpio_count(const struct fwnode_handle *fwnode, const char *con_id)
 /* Run deferred acpi_gpiochip_request_irqs() */
 static int __init acpi_gpio_handle_deferred_request_irqs(void)
 {
-	struct acpi_gpio_chip *acpi_gpio, *tmp;
-
 	mutex_lock(&acpi_gpio_deferred_req_irqs_lock);
-	list_for_each_entry_safe(acpi_gpio, tmp,
-				 &acpi_gpio_deferred_req_irqs_list,
-				 deferred_req_irqs_list_entry)
-		acpi_gpiochip_request_irqs(acpi_gpio);
-
+	acpi_gpio_process_deferred_list(&acpi_gpio_deferred_req_irqs_list);
 	acpi_gpio_deferred_req_irqs_done = true;
 	mutex_unlock(&acpi_gpio_deferred_req_irqs_lock);
 
